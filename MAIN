@@ -1,0 +1,390 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+SFS-GBC: Supervised Feature Selection Guided by Granular-Ball Computing.
+A Two-Stage Geometry-Driven Framework for robust feature selection.
+
+This script integrates both Stage I (Granularity Consistency Ranking)
+and Stage II (Geometric Granular-Ball Evaluation).
+"""
+
+import os
+import copy
+import pickle
+import warnings
+import traceback
+import itertools
+import numpy as np
+import pandas as pd
+from sklearn.cluster import KMeans
+from scipy.spatial.distance import cdist
+from sklearn.preprocessing import LabelEncoder, OneHotEncoder, MinMaxScaler
+warnings.filterwarnings('ignore')
+
+
+# ==========================================
+# Core Granular-Ball Operations
+# ==========================================
+
+def cal_GB_r_c(gb_data):
+    """
+    Calculate the geometric center, max radius, and mean radius of a granular ball.
+    """
+    c = np.sum(gb_data, axis=0) / len(gb_data)
+    distances = cdist(c.reshape(1, len(c)), gb_data, 'euclidean')
+    r = np.max(distances)
+    m = np.sum(distances) / len(gb_data)
+    return c, r, m
+
+
+class GranularBall:
+    """
+    Represents a single Granular Ball entity.
+    """
+
+    def __init__(self, data, label):
+        self.GB_data = data
+        self.GB_label = label
+        self.GB_c, self.GB_r, self.GB_m = cal_GB_r_c(gb_data=self.GB_data)
+
+        if len(self.GB_data) > 0:
+            dist_to_c = cdist(self.GB_c.reshape(1, -1), self.GB_data, 'euclidean')
+            self.ICC_gb = 1 - (np.sum(dist_to_c / (self.GB_r + 1e-4)) / len(self.GB_data))
+        else:
+            self.ICC_gb = 0
+
+
+# ==========================================
+# Stage II: Granular-Ball Evaluator (GBFI)
+# ==========================================
+
+class GBFI:
+    """
+    Granular-Ball Feature Index (GBFI) Evaluator.
+    Constructs the granular ball manifold and evaluates feature subsets
+    using ICC (Intra-class Compactness) and ICD (Inter-class Discrimination).
+    """
+
+    def __init__(self, data, judge_attr, B_index, class_value, class_v_num):
+        self.data = data
+        self.judge_attr = judge_attr
+        self.B_index = B_index
+        self.class_value = class_value
+        self.class_v_num = class_v_num
+
+        self.attr_num = len(self.data.columns) - 1
+        self.class_name = self.data.columns[-1]
+        self.class_num = len(self.class_value)
+        self.sample_num = len(self.data)
+
+        self.old_cover_rate = 0.05
+        self.last_cover_rate = None
+        self.nominal_num = 0
+        self.GB_list = []
+        self.ICC = 0
+        self.ICD = 0
+
+    def data_deal(self):
+        """Encodes nominal (discrete) attributes dynamically using One-Hot Encoding."""
+        B_nominal_index = (np.array(self.judge_attr)[self.B_index] == 0)
+        B_nominal_index = np.array(self.data.columns[:-1])[B_nominal_index].tolist()
+
+        if len(B_nominal_index) > 0:
+            self.nominal_num = len(B_nominal_index)
+            B_nominal_data = OneHotEncoder().fit_transform(self.data[B_nominal_index].values).toarray()
+            self.data = pd.concat([self.data.iloc[:, :-1], pd.DataFrame(data=B_nominal_data), self.data.iloc[:, -1]],
+                                  axis=1)
+            self.data.drop(columns=B_nominal_index, inplace=True)
+
+    def two_means_split(self, x):
+        """Binary partition using KMeans."""
+        return KMeans(n_clusters=2, n_init=10).fit_predict(x)
+
+    def GB_split(self, gb_index=0, gb_label=None):
+        """Recursively splits balls until the justifiable granularity criterion is met."""
+        while gb_index < len(self.GB_list):
+            x_data = self.GB_list[gb_index].GB_data
+            if len(x_data) > np.sqrt(self.sample_num):
+                _, _, m = cal_GB_r_c(x_data)
+                cluster_label = self.two_means_split(x_data)
+                gb_data_1 = x_data[cluster_label == 0]
+                gb_data_2 = x_data[cluster_label == 1]
+
+                if len(gb_data_1) == 0 or len(gb_data_2) == 0:
+                    gb_index += 1
+                else:
+                    _, _, m_1 = cal_GB_r_c(gb_data_1)
+                    _, _, m_2 = cal_GB_r_c(gb_data_2)
+                    if m <= m_1 and m <= m_2:
+                        gb_index += 1
+                    else:
+                        self.GB_list.append(GranularBall(gb_data_1, gb_label))
+                        self.GB_list.append(GranularBall(gb_data_2, gb_label))
+                        self.GB_list.pop(gb_index)
+            else:
+                gb_index += 1
+
+    def GB_split_again(self, gb_label):
+        """Merges isolated singletons and re-splits them to refine boundaries."""
+        while True:
+            gb_cover_list = [len(g.GB_data) for g in self.GB_list]
+            self.last_cover_rate = 1 - np.sum(np.array(gb_cover_list) == 1) / self.sample_num
+            cover_incre_ratio = (self.last_cover_rate - self.old_cover_rate) / self.old_cover_rate
+            single_gb_index = np.where(np.array(gb_cover_list) == 1)[0]
+
+            if cover_incre_ratio > 0.0015 and len(single_gb_index) != 0:
+                all_x = [g.GB_data for g in self.GB_list]
+                poly_x = np.vstack([all_x[i] for i in single_gb_index])
+
+                self.GB_list = [g for i, g in enumerate(self.GB_list) if i not in single_gb_index]
+                self.GB_list.append(GranularBall(poly_x, gb_label))
+                self.GB_split(gb_index=len(self.GB_list) - 1, gb_label=None)
+                self.old_cover_rate = copy.deepcopy(self.last_cover_rate)
+            else:
+                break
+
+    def cal_GBFI(self):
+        """Calculates the geometric evaluation score (ICC + ICD)."""
+        # Assign 0 ICC to singletons/noise
+        for gb in self.GB_list:
+            if len(gb.GB_data) == 1:
+                gb.ICC_gb = 0
+
+        gb_D_list = np.array([gb.GB_label for gb in self.GB_list])
+        ICC_list = np.array([gb.ICC_gb for gb in self.GB_list])
+        gb_c_list = np.array([gb.GB_c for gb in self.GB_list])
+        gb_r_list = np.array([gb.GB_r for gb in self.GB_list])
+
+        # 1. Compute Intra-class Compactness (ICC)
+        for D_name in self.class_value:
+            D_index = np.where(gb_D_list == D_name)[0]
+            if len(D_index) > 0:
+                self.ICC += np.sum(ICC_list[D_index]) / len(D_index) / self.class_num
+
+        # 2. Compute Inter-class Discrimination (ICD) with Dimensional Normalization
+        class_pairs = list(itertools.combinations(self.class_value, 2))
+        for p1, p2 in class_pairs:
+            idx1 = np.where(gb_D_list == p1)[0]
+            idx2 = np.where(gb_D_list == p2)[0]
+            if len(idx1) == 0 or len(idx2) == 0:
+                continue
+
+            grid_x, grid_y = np.meshgrid(gb_r_list[idx1], gb_r_list[idx2])
+            gb_r_max = np.maximum(grid_x, grid_y).T
+            dist_mat = cdist(gb_c_list[idx1], gb_c_list[idx2], 'euclidean')
+            S_gb_mat = (dist_mat - gb_r_max) / np.sqrt(self.attr_num + self.nominal_num)
+            S_gb_mat[S_gb_mat < 0] = 0
+
+            self.ICD += 2 * (1 - np.sum(S_gb_mat) / len(idx1) / len(idx2)) / self.class_num / (self.class_num - 1)
+
+    def run(self):
+        """Execute the evaluation pipeline for the current subset."""
+        self.data_deal()
+        for class_v in self.class_value:
+            x = np.float64(self.data[self.data.iloc[:, -1] == class_v].values[:, :-1])
+            if len(x) == 0: continue
+            self.attr_num = x.shape[1]
+
+            self.GB_list.append(GranularBall(x, class_v))
+            self.GB_split(gb_label=class_v)
+            self.GB_split_again(gb_label=class_v)
+
+        self.cal_GBFI()
+        return self.ICC + self.ICD
+
+
+# ==========================================
+# Stage I & Orchestrator: SFS_GBC
+# ==========================================
+
+class SFS_GBC:
+    """
+    Main Orchestrator for the SFS-GBC framework.
+    Manages global Granularity Consistency (GC) ranking and multiscale forward search.
+    """
+
+    def __init__(self, data):
+        self.data = data
+        self.sample_num = len(self.data)
+        self.class_name = self.data.columns[-1]
+        self.attr_names = self.data.columns[:-1]
+        self.attr_num = len(self.attr_names)
+        self.attr_list = list(range(self.attr_num))
+
+        self.class_value = None
+        self.class_num = None
+        self.class_v_num = None
+
+        self.fuzzy_list = [None] * self.attr_num
+        self.origin_fuzzy_list = [None] * self.attr_num
+        self.judge_attr = [0] * self.attr_num
+
+        self.GC_list_ori = [0] * self.attr_num
+        self.GC_list = None
+        self.GC_sort = None
+
+        self.a_B_D_max = None
+        self.reduction = []
+        self.multi_granularity_results = []
+        self.D_mat = None
+
+    def cal_GC(self, c_mat):
+        """Calculates Granularity Consistency (GC) for a specific feature."""
+        U_mat = np.abs(c_mat - self.D_mat)
+        OGC_c = np.sum(1 - np.sum(U_mat, axis=1) / self.sample_num) / self.sample_num
+        LGC_c = 0
+
+        for j, d_value in enumerate(self.class_value):
+            sample_idx = np.where(self.data[self.class_name] == d_value)[0]
+            d_sample_mat_1 = c_mat[sample_idx]
+            d_sample_mat_2 = np.tile(np.array(self.data[self.class_name] == d_value).astype(int),
+                                     (self.class_v_num[j], 1))
+
+            num = np.sum(np.minimum(d_sample_mat_1, d_sample_mat_2), axis=1)
+            den = np.sum(d_sample_mat_1, axis=1)
+            den[den == 0] = 1e-8
+
+            lgc_c = np.sum(num / den) / self.class_v_num[j]
+            LGC_c += (lgc_c / self.class_num)
+
+        return OGC_c + LGC_c
+
+    def data_deal(self):
+        """Initial data preprocessing, encoding, and global matrix computation."""
+        self.data[self.class_name] = LabelEncoder().fit_transform(self.data[self.class_name])
+        counts = self.data[self.class_name].value_counts()
+        self.class_value = counts.index.tolist()
+        self.class_v_num = counts.values.tolist()
+        self.class_num = len(self.class_value)
+
+        d_vector = self.data[self.class_name].values.reshape(1, self.sample_num)
+        self.D_mat = (d_vector == d_vector.T).astype(int)
+
+        for i, name in enumerate(self.attr_names):
+            if pd.api.types.is_numeric_dtype(self.data[name]) and np.std(self.data[name]) > 0:
+                self.judge_attr[i] = 1
+                self.data[[name]] = MinMaxScaler().fit_transform(self.data[[name]])
+                vector = self.data[name].values.reshape(1, self.sample_num)
+                self.origin_fuzzy_list[i] = (1 - np.abs(vector - vector.T))
+            else:
+                self.judge_attr[i] = 0
+                vector = self.data[name].values.reshape(1, self.sample_num)
+                self.fuzzy_list[i] = (vector == vector.T).astype(int)
+                self.GC_list_ori[i] = self.cal_GC(c_mat=self.fuzzy_list[i])
+
+    def change_radius(self, sigma):
+        """Adjusts the geometric neighborhood radius for continuous variables."""
+        for i, name in enumerate(self.attr_names):
+            if self.judge_attr[i] != 0:
+                threshold = np.std(self.data[name]) / sigma
+                replace_mat = self.origin_fuzzy_list[i]
+                self.fuzzy_list[i] = np.where(replace_mat < 1 - threshold, 0, replace_mat)
+                self.GC_list_ori[i] = self.cal_GC(c_mat=self.fuzzy_list[i])
+
+    def feature_selection(self, lanbda=0.96):
+        """Executes the geometric forward search guided by Granular-Ball evaluation."""
+        best_initial_feature = int(np.argmax(self.GC_list))
+        self.reduction.append(best_initial_feature)
+
+        # Sort features based on GC score in descending order
+        self.GC_sort = np.argsort(self.GC_list)[::-1].tolist()
+        self.GC_sort.remove(best_initial_feature)
+
+        B_attr = copy.deepcopy(self.reduction)
+        B_attr.append(-1)
+        builder = GBFI(data=self.data.iloc[:, B_attr], judge_attr=self.judge_attr,
+                       B_index=B_attr[:-1], class_value=self.class_value, class_v_num=self.class_v_num)
+        self.a_B_D_max = builder.run()
+        del builder
+        for i in self.GC_sort:
+            B_attr = copy.deepcopy(self.reduction)
+            B_attr.append(i)
+            B_attr.append(-1)
+
+            builder = GBFI(data=self.data.iloc[:, B_attr], judge_attr=self.judge_attr,
+                           B_index=B_attr[:-1], class_value=self.class_value, class_v_num=self.class_v_num)
+            a_B_D = builder.run()
+
+            Imp = a_B_D - lanbda * self.a_B_D_max
+            if Imp > 0:
+                self.reduction.append(i)
+                self.a_B_D_max = a_B_D
+            del builder
+
+    def run(self, sigmas=np.arange(0.5, 2.1, 0.1), lanbda=''):
+        """
+        Runs the full multiscale scanning pipeline.
+        Iterates over a continuous spectrum of topological scales (sigma).
+        """
+        self.data_deal()
+
+        for sigma in sigmas:
+            self.change_radius(sigma=sigma)
+            self.GC_list = copy.deepcopy(self.GC_list_ori)
+            self.feature_selection(lanbda=lanbda)
+
+            self.multi_granularity_results.append(copy.deepcopy(self.reduction))
+            self.reduction.clear()
+
+        return self.multi_granularity_results
+
+
+# ==========================================
+# Execution Pipeline
+# ==========================================
+
+def run_sfs_gbc_on_dataset(dataset_name, csv_file_path, results_dir):
+    """Utility function to run the model on a single dataset and save results."""
+    print(f"\n=== Processing Dataset: {dataset_name} ===")
+    try:
+        df = pd.read_csv(csv_file_path, engine='python')
+        df.rename(columns={df.columns[-1]: 'Class'}, inplace=True)
+        print(f"Shape: {df.shape} | Classes: {df['Class'].nunique()}")
+
+        model = SFS_GBC(data=df)
+        sigmas_to_test = np.arange(0.5, 2.1, 0.1)
+        results = model.run(sigmas=sigmas_to_test, lanbda='')#0.9-0.99 choose the best
+
+        # Output saving
+        output_file = os.path.join(results_dir, f"{dataset_name}.pkl")
+        with open(output_file, 'wb') as f:
+            pickle.dump(results, f)
+
+        print(f"Success! Results saved to: {output_file}")
+        for i, res in enumerate(results):
+            print(f"  -> Sigma {sigmas_to_test[i]:.1f}: Selected {len(res)} features")
+
+        return True
+
+    except Exception as e:
+        print(f"Error processing dataset {dataset_name}: {e}")
+        traceback.print_exc()
+        return False
+
+
+def main():
+    """Batch processing runner."""
+    base_dir = os.getcwd()
+    datasets_dir = os.path.join(base_dir, "numerical data")
+    results_dir = os.path.join(base_dir, "SFS_GBC_Results")
+    os.makedirs(results_dir, exist_ok=True)
+
+    # Configure your datasets here
+    datasets_config = { }
+    success_count = 0
+    print("=== SFS-GBC Batch Processing Started ===")
+
+    for dataset_name, filename in datasets_config.items():
+        csv_path = os.path.join(datasets_dir, filename)
+        if os.path.exists(csv_path):
+            if run_sfs_gbc_on_dataset(dataset_name, csv_path, results_dir):
+                success_count += 1
+        else:
+            print(f"Warning: Dataset file not found -> {csv_path}")
+
+    print(f"\n=== Processing Complete. Successfully processed: {success_count}/{len(datasets_config)} ===")
+
+
+if __name__ == "__main__":
+    main()

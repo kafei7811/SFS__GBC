@@ -1,4 +1,4 @@
-# SFS-GBC: Supervised Feature Selection Guided by Granular-Ball Computing
+# Supervised Feature Selection Guided by Granular-Ball Computing: A Two-Stage Geometry-Driven Framework
 
 This repository contains the official implementation of **SFS-GBC**, a two-stage geometry-driven framework for supervised feature selection.
 
@@ -7,10 +7,7 @@ Unlike traditional statistical feature selection methods, SFS-GBC leverages the 
 1. **Stage I (Coarse-grained)**: Rapidly ranks features using **Granularity Consistency (GC)**.
 2. **Stage II (Fine-grained)**: Refines the feature subset via forward search guided by **Intra-class Compactness (ICC)** and **Inter-class Discrimination (ICD)**.
 
-## Key Features
-- **Dimensional Normalization**: Includes a $\sqrt{|B|}$ factor in distance calculations to prevent the "curse of dimensionality" during feature evaluation.
-- **Adaptive Granularity**: Automatically partitions the feature space into hyperspheres based on data density and class purity.
-- **Robustness**: High resistance to boundary noise by abstracting points into geometric entities.
+
 
 ## Requirements
 - Python 3.8+

@@ -30,7 +30,7 @@ import pandas as pd
 df = pd.read_csv('your_data.csv')
 
 # Initialize and run
-selector = SFS_GBC(data=df, lam=0.96)
+selector = SFS_GBC(data=df, lam='')
 selected_features = selector.run()
 
 print(f"Optimal feature indices: {selected_features}")
